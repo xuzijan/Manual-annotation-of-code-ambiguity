@@ -1,0 +1,10 @@
+{
+  "name": "iaa-quiz",
+  "version": "1.0.0",
+  "description": "Minimalist Quiz Experience - IAA 标注问卷",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  }
+}

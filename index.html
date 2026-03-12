@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"/>
+  <meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+  <title>Minimalist Quiz Experience</title>
+  <script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+  <!-- Markdown rendering + sanitization + optional code highlighting (no build step) -->
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"></script>
+  <link href="https://fonts.googleapis.com" rel="preconnect"/>
+  <link crossorigin="" href="https://fonts.gstatic.com" rel="preconnect"/>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500&display=swap" rel="stylesheet"/>
+  <style>
+    body {
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+    }
+    /* Minimal markdown defaults inside the question box */
+    .md p { margin: 0.5rem 0; }
+    .md ul { list-style: disc; padding-left: 1.25rem; margin: 0.5rem 0; }
+    .md ol { list-style: decimal; padding-left: 1.25rem; margin: 0.5rem 0; }
+    .md li { margin: 0.25rem 0; }
+    .md code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; font-size: 0.85em; }
+    .md pre { margin: 0.75rem 0; padding: 0.75rem; border: 1px solid #E5E7EB; border-radius: 0.75rem; background: #fff; overflow: auto; }
+    .md pre code { display: block; white-space: pre; }
+    .md a { text-decoration: underline; }
+    .code-wrap { position: relative; }
+    .copy-btn {
+      position: absolute;
+      top: 0.5rem;
+      right: 0.5rem;
+      font-size: 12px;
+      padding: 0.25rem 0.5rem;
+      border-radius: 0.375rem;
+      border: 1px solid #E5E7EB;
+      background: rgba(255,255,255,0.9);
+      color: #111827;
+    }
+    .copy-btn:hover { border-color: #111827; }
+
+    /* Message cards */
+    .msg-card { border: 1px solid #E5E7EB; background: rgba(255,255,255,0.7); border-radius: 0.75rem; padding: 1rem; }
+    .msg-header { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.5rem; }
+    .role-badge { font-size: 11px; letter-spacing: 0.18em; }
+  </style>
+</head>
+<body class="bg-[#F9FAFB] text-[#111827] overflow-hidden">
+  <div class="h-screen w-screen flex flex-col items-center justify-center relative px-4" id="app">
+    <div class="absolute top-0 left-0 w-full h-1 bg-gray-100">
+      <div class="h-full bg-black transition-all duration-500" id="progress-bar" style="width: 0%"></div>
+    </div>
+
+    <nav class="absolute top-12 left-0 w-full px-12 flex justify-between items-center pointer-events-none" data-purpose="navigation-overlay">
+      <button aria-label="上一题" class="pointer-events-auto p-2 text-gray-400 hover:text-black transition-colors duration-300 disabled:opacity-0" id="prev-btn" onclick="appState.prevQuestion()">
+        <svg fill="none" height="24" stroke="currentColor" stroke-width="1.5" viewbox="0 0 24 24" width="24" xmlns="http://www.w3.org/2000/svg">
+          <path d="M15.75 19.5L8.25 12l7.5-7.5" stroke-linecap="round" stroke-linejoin="round"></path>
+        </svg>
+      </button>
+      <button aria-label="下一题" class="pointer-events-auto p-2 text-gray-400 hover:text-black transition-colors duration-300 disabled:opacity-0" id="next-btn" onclick="appState.nextQuestion()">
+        <svg fill="none" height="24" stroke="currentColor" stroke-width="1.5" viewbox="0 0 24 24" width="24" xmlns="http://www.w3.org/2000/svg">
+          <path d="M8.25 4.5l7.5 7.5-7.5 7.5" stroke-linecap="round" stroke-linejoin="round"></path>
+        </svg>
+      </button>
+    </nav>
+
+    <main class="w-full max-w-[1400px] flex flex-col items-center" data-purpose="quiz-container">
+      <div class="mb-10 text-center transition-all duration-500 w-full px-4" id="question-container">
+        <div class="bg-gray-50 border border-gray-200 rounded-lg p-6 md:p-8 w-full max-w-[1200px] mx-auto shadow-sm max-h-[60vh] overflow-y-auto">
+          <div class="text-left" id="question-content"></div>
+        </div>
+      </div>
+
+      <div class="flex flex-col items-center gap-6" id="options-container">
+        <div class="flex flex-nowrap justify-center gap-4" id="row-1"></div>
+        <div class="flex flex-nowrap justify-center gap-4" id="row-2"></div>
+      </div>
+
+      <div class="hidden text-center animate-pulse" id="completion-screen">
+        <h1 class="text-5xl font-light tracking-widest text-gray-900">感谢作答</h1>
+      </div>
+    </main>
+  </div>
+
+  <script>
+    const API_BASE = window.location.origin;
+
+    function splitConversation(text) {
+      // Question text is assembled as: dialogue_lines.join("\n\n")
+      // Split only at boundaries that look like a new USER/LLM message.
+      return String(text)
+        .split(/\n\n(?=USER:\s|LLM:\s)/g)
+        .map(s => s.trim())
+        .filter(Boolean)
+        .map(raw => {
+          if (raw.startsWith('USER: ')) return { role: 'USER', content: raw.slice(6) };
+          if (raw.startsWith('LLM: ')) return { role: 'LLM', content: raw.slice(5) };
+          return { role: 'TEXT', content: raw };
+        });
+    }
+
+    function renderMarkdownSafe(md) {
+      // Marked -> DOMPurify
+      const rawHtml = marked.parse(md ?? '', { gfm: true, breaks: true });
+      return DOMPurify.sanitize(rawHtml, { USE_PROFILES: { html: true } });
+    }
+
+    function escapeHtml(s) {
+      return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    }
+
+    function attachCopyButtons(container) {
+      const pres = container.querySelectorAll('pre');
+      pres.forEach(pre => {
+        if (pre.parentElement && pre.parentElement.classList.contains('code-wrap')) return;
+        const wrap = document.createElement('div');
+        wrap.className = 'code-wrap';
+        pre.parentNode.insertBefore(wrap, pre);
+        wrap.appendChild(pre);
+
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'copy-btn';
+        btn.textContent = 'Copy';
+        btn.onclick = async () => {
+          const code = pre.innerText || '';
+          try {
+            await navigator.clipboard.writeText(code);
+            btn.textContent = 'Copied';
+            setTimeout(() => (btn.textContent = 'Copy'), 900);
+          } catch {
+            btn.textContent = 'Failed';
+            setTimeout(() => (btn.textContent = 'Copy'), 900);
+          }
+        };
+        wrap.appendChild(btn);
+      });
+    }
+
+    function renderConversation(containerEl, text) {
+      containerEl.innerHTML = '';
+
+      const blocks = splitConversation(text);
+      const frag = document.createDocumentFragment();
+
+      blocks.forEach(({ role, content }) => {
+        const card = document.createElement('div');
+        card.className = 'msg-card mb-4 last:mb-0';
+
+        if (role === 'USER' || role === 'LLM') {
+          const header = document.createElement('div');
+          header.className = 'msg-header';
+          header.innerHTML = `<span class="role-badge text-red-600">${role}</span>`;
+          card.appendChild(header);
+
+          const body = document.createElement('div');
+          body.className = `md text-sm leading-relaxed break-words ${role === 'USER' ? 'text-blue-600' : 'text-gray-900'}`;
+          body.innerHTML = renderMarkdownSafe(content);
+          card.appendChild(body);
+        } else {
+          const body = document.createElement('div');
+          body.className = 'md text-sm leading-relaxed text-gray-900 break-words';
+          body.innerHTML = renderMarkdownSafe(content);
+          card.appendChild(body);
+        }
+
+        frag.appendChild(card);
+      });
+
+      containerEl.appendChild(frag);
+      attachCopyButtons(containerEl);
+    }
+
+    const options = [
+      { en: "Domain-Cognitive Polysemy", zh: "领域认知多义性" },
+      { en: "Structural Logic Misalignment", zh: "逻辑结构映射误差" },
+      { en: "Habitual Context Omission", zh: "习惯性语境缺失" },
+      { en: "System Boundary Misconception", zh: "系统边界认知错位" },
+      { en: "Conversational Memory Disalignment", zh: "交互上下文失焦" },
+      { en: "Implicit Constraint Under-specification", zh: "隐式约束说明不足" },
+      { en: "Not Ambiguous", zh: "无歧义 / 纯粹的模型能力不足" },
+      { en: "Other", zh: "其他 / 无法归类" }
+    ];
+
+    const appState = {
+      questions: [],
+      currentIndex: 0,
+      answers: {},
+      isComplete: false,
+
+      async init() {
+        try {
+          const [questions, progress] = await Promise.all([
+            fetch(API_BASE + '/api/questions').then(r => r.json()),
+            fetch(API_BASE + '/api/progress').then(r => r.json())
+          ]);
+          this.questions = questions;
+          this.currentIndex = Math.min(progress.currentIndex ?? 0, questions.length - 1);
+          this.answers = progress.answers ?? {};
+        } catch (e) {
+          console.warn('API 不可用，使用本地 mock 数据', e);
+          const mock = await this.fetchLocalMock();
+          this.questions = mock.questions;
+          this.currentIndex = Math.min(mock.progress.currentIndex ?? 0, mock.questions.length - 1);
+          this.answers = mock.progress.answers ?? {};
+        }
+        this.isComplete = this.questions.length > 0 && this.questions.every(q => this.answers[q.id] !== undefined);
+        this.render();
+      },
+
+      async fetchLocalMock() {
+        const questions = [
+          {
+            id: 1,
+            text: `{
+  "context": "user_query_analysis",
+  "input": "帮我写一个关于量子纠缠的科普文案，要通俗易懂。",
+  "model_output_status": "pending",
+  "ambiguity_detected": true,
+  "parameters": {
+    "tone": "educational",
+    "length": "medium",
+    "target_audience": "general_public"
+  }
+}`
+          },
+          {
+            id: 2,
+            text: "{\n  \"instruction\": \"Analyze system logs\",\n  \"status\": \"error_detected\"\n}"
+          }
+        ];
+        return {
+          questions,
+          progress: { currentIndex: 0, answers: {} }
+        };
+      },
+
+      async selectOption(optionIndex) {
+        const question = this.questions[this.currentIndex];
+        this.answers[question.id] = optionIndex;
+        try {
+          await fetch(API_BASE + '/api/answer', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ questionId: question.id, answer: optionIndex })
+          });
+        } catch (e) {
+          console.warn('保存答案失败', e);
+        }
+        setTimeout(() => this.nextQuestion(), 400);
+      },
+
+      nextQuestion() {
+        if (this.currentIndex < this.questions.length - 1) {
+          this.currentIndex++;
+          this.render();
+        } else {
+          this.completeQuiz();
+        }
+      },
+
+      prevQuestion() {
+        if (this.currentIndex > 0) {
+          this.currentIndex--;
+          this.render();
+        }
+      },
+
+      completeQuiz() {
+        this.isComplete = true;
+        this.render();
+      },
+
+      render() {
+        const qContainer = document.getElementById('question-container');
+        const oContainer = document.getElementById('options-container');
+        const completion = document.getElementById('completion-screen');
+        const nav = document.querySelector('nav');
+        const progressBar = document.getElementById('progress-bar');
+
+        if (this.isComplete) {
+          [qContainer, oContainer, nav].forEach(el => el.classList.add('hidden'));
+          completion.classList.remove('hidden');
+          progressBar.style.width = '100%';
+          return;
+        }
+
+        const question = this.questions[this.currentIndex];
+        renderConversation(document.getElementById('question-content'), question.text);
+
+        const progressPercent = this.questions.length ? ((this.currentIndex + 1) / this.questions.length) * 100 : 0;
+        progressBar.style.width = `${progressPercent}%`;
+
+        document.getElementById('prev-btn').style.visibility = (this.currentIndex === 0) ? 'hidden' : 'visible';
+        document.getElementById('next-btn').disabled = !this.answers[question.id];
+
+        this.renderOptions(question.id);
+      },
+
+      renderOptions(questionId) {
+        const row1 = document.getElementById('row-1');
+        const row2 = document.getElementById('row-2');
+        row1.innerHTML = '';
+        row2.innerHTML = '';
+
+        options.forEach((opt, idx) => {
+          const btn = document.createElement('button');
+          const isSelected = this.answers[questionId] === idx;
+          btn.className = `
+            group flex flex-col items-center justify-center p-3 border rounded-lg transition-all duration-200 text-center w-[180px] h-[80px]
+            ${isSelected
+              ? 'bg-black border-black text-white shadow-lg scale-[1.02]'
+              : 'bg-white border-gray-200 hover:border-black hover:bg-gray-50'}
+          `;
+          btn.innerHTML = `
+            <span class="text-[11px] uppercase tracking-wider font-medium mb-1 ${isSelected ? 'text-gray-300' : 'text-black'}">${opt.en}</span>
+            <span class="text-xs font-normal ${isSelected ? 'text-white' : 'text-gray-500'}">${opt.zh}</span>
+          `;
+          btn.onclick = () => this.selectOption(idx);
+
+          if (idx < 4) row1.appendChild(btn);
+          else row2.appendChild(btn);
+        });
+      }
+    };
+
+    window.addEventListener('DOMContentLoaded', () => appState.init());
+  </script>
+</body>
+</html>
