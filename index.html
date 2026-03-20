@@ -111,6 +111,12 @@
         <div class="flex flex-nowrap justify-center gap-4" id="row-2"></div>
       </div>
 
+      <div class="hidden flex justify-center mt-4" id="confirm-container">
+        <button id="confirm-btn" class="inline-flex items-center justify-center rounded-lg bg-black text-white px-5 py-2.5 text-sm hover:bg-gray-900 transition-colors" type="button" onclick="appState.confirmAnswer()" disabled>
+          确认答案
+        </button>
+      </div>
+
       <div class="hidden text-center animate-pulse" id="completion-screen">
         <h1 class="text-5xl font-light tracking-widest text-gray-900">感谢作答</h1>
         <div class="mt-8">
@@ -226,6 +232,7 @@
       questions: [],
       currentIndex: 0,
       answers: {},
+      pendingSelections: {},
       isComplete: false,
       respondentNameEn: '',
       datasetId: null,
@@ -240,6 +247,7 @@
           const dsKey = this.isValidDatasetId(this.datasetId) ? String(Number(this.datasetId)) : null;
           const dsProgress = dsKey ? (progress.datasets?.[dsKey] ?? progress.datasets?.[Number(dsKey)] ?? null) : null;
           this.answers = dsProgress?.answers ?? {};
+          this.pendingSelections = {};
           this.needsMetadata = !(this.isValidRespondentNameEn(this.respondentNameEn) && this.isValidDatasetId(this.datasetId));
 
           if (!this.needsMetadata) {
@@ -256,11 +264,12 @@
           this.questions = mock.questions;
           this.currentIndex = Math.min(mock.progress.currentIndex ?? 0, mock.questions.length - 1);
           this.answers = mock.progress.answers ?? {};
+          this.pendingSelections = {};
           this.respondentNameEn = '';
           this.datasetId = null;
           this.needsMetadata = true;
         }
-        this.isComplete = !this.needsMetadata && this.questions.length > 0 && this.questions.every(q => this.answers[q.id] !== undefined);
+        this.isComplete = !this.needsMetadata && this.questions.length > 0 && this.questions.every(q => Array.isArray(this.answers[q.id]) && this.answers[q.id].length > 0);
         this.render();
       },
 
@@ -318,7 +327,7 @@
           const questions = await fetch(API_BASE + '/api/questions').then(r => r.json());
           this.questions = questions;
           this.currentIndex = Math.min(this.currentIndex ?? 0, questions.length - 1);
-          this.isComplete = this.questions.length > 0 && this.questions.every(q => this.answers[q.id] !== undefined);
+          this.isComplete = this.questions.length > 0 && this.questions.every(q => Array.isArray(this.answers[q.id]) && this.answers[q.id].length > 0);
           this.render();
         } catch (e) {
           if (err) err.textContent = '保存失败：请检查英文名与数据集编号（1-20），并确保服务端已启动。';
@@ -360,20 +369,44 @@
         };
       },
 
-      async selectOption(optionIndex) {
-        if (this.needsMetadata) return;
+      selectOption(optionIndex) {
+        if (this.needsMetadata || this.isComplete) return;
         const question = this.questions[this.currentIndex];
-        this.answers[question.id] = optionIndex;
+        const questionId = question.id;
+        const curr = new Set(this.pendingSelections[questionId] || this.answers[questionId] || []);
+        if (curr.has(optionIndex)) {
+          curr.delete(optionIndex);
+        } else {
+          curr.add(optionIndex);
+        }
+        this.pendingSelections[questionId] = Array.from(curr).sort((a, b) => a - b);
+        this.render();
+      },
+
+      async confirmAnswer() {
+        if (this.needsMetadata || this.isComplete) return;
+        const question = this.questions[this.currentIndex];
+        const questionId = question.id;
+        const selected = this.pendingSelections[questionId] || [];
+        if (!Array.isArray(selected) || selected.length === 0) return;
+
+        this.answers[questionId] = selected;
         try {
           await fetch(API_BASE + '/api/answer', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ questionId: question.id, answer: optionIndex })
+            body: JSON.stringify({ questionId, answer: selected })
           });
         } catch (e) {
           console.warn('保存答案失败', e);
         }
-        setTimeout(() => this.nextQuestion(), 400);
+
+        this.currentIndex = Math.min(this.currentIndex + 1, this.questions.length);
+        if (this.currentIndex >= this.questions.length) {
+          this.completeQuiz();
+        } else {
+          this.render();
+        }
       },
 
       nextQuestion() {
@@ -409,7 +442,7 @@
         const changeBtn = document.getElementById('change-dataset-btn');
 
         if (this.needsMetadata) {
-          [qContainer, oContainer, completion, nav].forEach(el => el.classList.add('hidden'));
+          [qContainer, oContainer, completion, nav, document.getElementById('confirm-container')].forEach(el => el?.classList.add('hidden'));
           meta.classList.remove('hidden');
           progressBar.style.width = '0%';
           if (changeBtn) changeBtn.classList.add('hidden');
@@ -422,7 +455,7 @@
         }
 
         if (this.isComplete) {
-          [meta, qContainer, oContainer, nav].forEach(el => el.classList.add('hidden'));
+          [meta, qContainer, oContainer, nav, document.getElementById('confirm-container')].forEach(el => el?.classList.add('hidden'));
           completion.classList.remove('hidden');
           progressBar.style.width = '100%';
           if (changeBtn) changeBtn.classList.add('hidden');
@@ -440,7 +473,13 @@
         progressBar.style.width = `${progressPercent}%`;
 
         document.getElementById('prev-btn').style.visibility = (this.currentIndex === 0) ? 'hidden' : 'visible';
-        document.getElementById('next-btn').disabled = !this.answers[question.id];
+        document.getElementById('next-btn').disabled = false;
+
+        const confirmContainer = document.getElementById('confirm-container');
+        const confirmBtn = document.getElementById('confirm-btn');
+        if (confirmContainer) confirmContainer.classList.remove('hidden');
+        const pending = this.pendingSelections[question.id] || this.answers[question.id] || [];
+        if (confirmBtn) confirmBtn.disabled = !Array.isArray(pending) || pending.length === 0;
 
         this.renderOptions(question.id);
       },
@@ -453,16 +492,23 @@
 
         options.forEach((opt, idx) => {
           const btn = document.createElement('button');
-          const isSelected = this.answers[questionId] === idx;
+          const selectedSet = new Set(this.pendingSelections[questionId] || this.answers[questionId] || []);
+          const isSelected = selectedSet.has(idx);
           btn.className = `
-            group flex flex-col items-center justify-center p-3 border rounded-lg transition-all duration-200 text-center w-[180px] h-[80px]
+            group flex items-center justify-between gap-3 p-3 border rounded-lg transition-all duration-200 text-left w-[360px] h-[80px]
             ${isSelected
               ? 'bg-black border-black text-white shadow-lg scale-[1.02]'
-              : 'bg-white border-gray-200 hover:border-black hover:bg-gray-50'}
-          `;
+              : 'bg-white border-gray-200 hover:border-black hover:bg-gray-50'}`;
           btn.innerHTML = `
-            <span class="text-[11px] uppercase tracking-wider font-medium mb-1 ${isSelected ? 'text-gray-300' : 'text-black'}">${opt.en}</span>
-            <span class="text-xs font-normal ${isSelected ? 'text-white' : 'text-gray-500'}">${opt.zh}</span>
+            <div>
+              <div class="flex items-center gap-2">
+                <span class="w-4 h-4 border rounded-sm ${isSelected ? 'bg-white text-black border-black' : 'bg-white border-gray-400'} flex items-center justify-center">
+                  ${isSelected ? '✓' : ''}
+                </span>
+                <span class="text-[11px] uppercase tracking-wider font-medium ${isSelected ? 'text-gray-300' : 'text-black'}">${opt.en}</span>
+              </div>
+              <div class="text-xs font-normal ${isSelected ? 'text-white' : 'text-gray-500'}">${opt.zh}</div>
+            </div>
           `;
           btn.onclick = () => this.selectOption(idx);
 
